@@ -62,6 +62,85 @@ public:
   {}
 };
 //--------------------------
+class InfiniteAsyncTestAction : public BT::StatefulActionNode
+{
+  std::shared_ptr<bool> running_;
+
+public:
+  InfiniteAsyncTestAction(const std::string& name, const BT::NodeConfig& config,
+                          std::shared_ptr<bool> running)
+    : BT::StatefulActionNode(name, config), running_(running)
+  {}
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  NodeStatus onStart() override
+  {
+    if(*running_)
+    {
+      // throw RuntimeError("Two nodes are running at the same time");
+    }
+    *running_ = true;
+    return NodeStatus::RUNNING;
+  }
+
+  NodeStatus onRunning() override
+  {
+    return NodeStatus::RUNNING;
+  }
+  void onHalted() override
+  {
+    *running_ = false;
+  }
+};
+//--------------------------
+class ThrowingAsyncTestAction : public BT::StatefulActionNode
+{
+  int counter_ = 0;
+  std::string port_name_;
+  std::shared_ptr<bool> running_;
+
+public:
+  ThrowingAsyncTestAction(const std::string& name, const BT::NodeConfig& config,
+                          std::string port_name, std::shared_ptr<bool> running)
+    : BT::StatefulActionNode(name, config), port_name_(port_name), running_(running)
+  {}
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  NodeStatus onStart() override
+  {
+    if(*running_)
+    {
+      // throw RuntimeError("Two nodes are running at the same time");
+    }
+    *running_ = true;
+    counter_ = 0;
+    return NodeStatus::RUNNING;
+  }
+
+  NodeStatus onRunning() override
+  {
+    if(++counter_ == 2)
+    {
+      config().blackboard->set<bool>(port_name_, true);
+      *running_ = false;
+      return NodeStatus::SUCCESS;
+    }
+    return NodeStatus::RUNNING;
+  }
+  void onHalted() override
+  {
+    *running_ = false;
+  }
+};
+//--------------------------
 
 TEST(ReactiveBackchaining, EnsureWarm)
 {
@@ -186,6 +265,61 @@ TEST(ReactiveBackchaining, EnsureWarmWithEnsureHoldingHacket)
 
   // sixr tick: still warm (just the condition ticked)
   EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+}
+
+TEST(ReactiveBackchaining, NoSimultaneousExecutionOfAsyncNodes)
+{
+  // This test checks that no two async nodes are in state RUNNING at the same time.
+  // Ticking an async node, which was in IDLE before, should result in halting the previoulsy running node
+  // _before_ running executeTick() on the new node.
+  // The RetryUntilSuccessful nodes in this test setup exist to ensure that the propagation of the
+  // halt request traverses through decorator nodes.
+  static const char* xml_text = R"(
+  <root BTCPP_format="4">
+    <BehaviorTree ID="EnsureWarm">
+      <ReactiveSequence>
+        <ReactiveFallback>
+          <IsWarm/>
+          <RetryUntilSuccessful num_attempts="1">
+            <WarmUp name="warmup"/>
+          </RetryUntilSuccessful>
+        </ReactiveFallback>
+        <RetryUntilSuccessful num_attempts="1">
+          <PlayOutside name="play"/>
+        </RetryUntilSuccessful>
+      </ReactiveSequence>
+    </BehaviorTree>
+  </root>
+  )";
+
+  BehaviorTreeFactory factory;
+  auto running = std::make_shared<bool>(false);
+  factory.registerNodeType<SimpleCondition>("IsWarm", "is_warm");
+  factory.registerNodeType<ThrowingAsyncTestAction>("WarmUp", "is_warm", running);
+  factory.registerNodeType<InfiniteAsyncTestAction>("PlayOutside", running);
+
+  factory.registerBehaviorTreeFromText(xml_text);
+  Tree tree = factory.createTree("EnsureWarm");
+  BT::TreeObserver observer(tree);
+
+  // first tick: warm, playing outside
+  tree.subtrees[0]->blackboard->set("is_warm", true);
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(observer.getStatistics("play").current_status, NodeStatus::RUNNING);
+
+  // second tick: no longer warm --> go to warmup
+  tree.subtrees[0]->blackboard->set("is_warm", false);
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(observer.getStatistics("play").current_status, NodeStatus::IDLE);
+  EXPECT_EQ(observer.getStatistics("warmup").current_status, NodeStatus::RUNNING);
+
+  // third tick: still warming up
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(observer.getStatistics("warmup").current_status, NodeStatus::RUNNING);
+
+  // fourth tick: warmup succeeded --> go to play
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(observer.getStatistics("play").current_status, NodeStatus::RUNNING);
 }
 
 }  // namespace BT::test
